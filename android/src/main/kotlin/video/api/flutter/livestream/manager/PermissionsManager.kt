@@ -44,21 +44,24 @@ class PermissionsManager(
         onShowPermissionRationale: (List<String>, () -> Unit) -> Unit,
         onAtLeastOnePermissionDenied: () -> Unit
     ) {
+        val allGrantedCallback = onAllGranted
+        val showRationaleCallback = onShowPermissionRationale
+        val deniedCallback = onAtLeastOnePermissionDenied
         activity?.let {
             requestPermissions(it, permissions, object : IListener {
                 override fun onAllGranted() {
-                    onAllGranted()
+                    allGrantedCallback()
                 }
 
                 override fun onShowPermissionRationale(
                     permissions: List<String>,
                     onRequiredPermissionLastTime: () -> Unit
                 ) {
-                    onShowPermissionRationale(permissions, onRequiredPermissionLastTime)
+                    showRationaleCallback(permissions, onRequiredPermissionLastTime)
                 }
 
                 override fun onAtLeastOnePermissionDenied() {
-                    onAtLeastOnePermissionDenied()
+                    deniedCallback()
                 }
             })
         } ?: throw IllegalStateException("Missing Activity")
@@ -100,21 +103,24 @@ class PermissionsManager(
         onShowPermissionRationale: (() -> Unit) -> Unit,
         onDenied: () -> Unit
     ) {
+        val grantedCallback = onGranted
+        val showRationaleCallback = onShowPermissionRationale
+        val deniedCallback = onDenied
         activity?.let {
             requestPermissions(it, listOf(permission), object : IListener {
                 override fun onAllGranted() {
-                    onGranted()
+                    grantedCallback()
                 }
 
                 override fun onShowPermissionRationale(
                     permissions: List<String>,
                     onRequiredPermissionLastTime: () -> Unit
                 ) {
-                    onShowPermissionRationale(onRequiredPermissionLastTime)
+                    showRationaleCallback(onRequiredPermissionLastTime)
                 }
 
                 override fun onAtLeastOnePermissionDenied() {
-                    onDenied()
+                    deniedCallback()
                 }
             })
         } ?: throw IllegalStateException("Missing Activity")
@@ -132,11 +138,11 @@ class PermissionsManager(
             return false
         }
 
-        grantResults.forEach {
-            if (it == PackageManager.PERMISSION_GRANTED) {
-                listener.onGranted(permissions[grantResults.indexOf(it)])
+        grantResults.forEachIndexed { index, result ->
+            if (result == PackageManager.PERMISSION_GRANTED) {
+                listener.onGranted(permissions[index])
             } else {
-                listener.onDenied(permissions[grantResults.indexOf(it)])
+                listener.onDenied(permissions[index])
             }
         }
 
