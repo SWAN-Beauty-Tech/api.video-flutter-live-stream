@@ -1,0 +1,4 @@
+framework module HaishinKit {
+  header "HaishinKit-Swift.h"
+  export *
+}

@@ -1,0 +1,4 @@
+framework module ApiVideoLiveStream {
+  header "ApiVideoLiveStream-Swift.h"
+  export *
+}
