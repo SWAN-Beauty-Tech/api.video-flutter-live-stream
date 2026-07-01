@@ -15,7 +15,13 @@ A new flutter plugin project.
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
   s.dependency 'Flutter'
-  s.dependency 'ApiVideoLiveStream', "1.4.6"
+  # SWAN: ApiVideoLiveStream (+ its HaishinKit/Logboard deps) are vendored as
+  # prebuilt xcframeworks instead of the CocoaPods dependency. HaishinKit 1.9.3
+  # crashes swift-frontend (SIL ownership verifier in MixerNode) under Xcode 26
+  # whole-module optimization. The xcframeworks are prebuilt with the crash
+  # worked around, so consumers never recompile HaishinKit and no longer need a
+  # per-app Podfile post_install hack. Rebuild via ios/Frameworks/BUILD.md.
+  s.vendored_frameworks = 'Frameworks/ApiVideoLiveStream.xcframework', 'Frameworks/HaishinKit.xcframework', 'Frameworks/Logboard.xcframework'
   s.platform = :ios, '13.0'
 
   # Flutter.framework does not contain a i386 slice.
