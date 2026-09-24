@@ -1,19 +1,43 @@
 package video.api.flutter.livestream.manager
 
 import android.Manifest
+import android.content.Context
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
+import android.net.Uri
 import android.util.Size
 import android.view.Surface
 import io.flutter.view.TextureRegistry
-import io.github.thibaultbee.streampack.data.AudioConfig
-import io.github.thibaultbee.streampack.data.VideoConfig
-import io.github.thibaultbee.streampack.error.StreamPackError
-import io.github.thibaultbee.streampack.listeners.OnConnectionListener
-import io.github.thibaultbee.streampack.listeners.OnErrorListener
-import io.github.thibaultbee.streampack.streamers.live.BaseCameraLiveStreamer
+import io.github.thibaultbee.streampack.core.elements.encoders.AudioCodecConfig
+import io.github.thibaultbee.streampack.core.elements.encoders.VideoCodecConfig
+import io.github.thibaultbee.streampack.core.elements.sources.audio.audiorecord.MicrophoneSourceFactory
+import io.github.thibaultbee.streampack.core.elements.sources.video.camera.ICameraSource
+import io.github.thibaultbee.streampack.core.elements.sources.video.camera.extensions.defaultCameraId
+import io.github.thibaultbee.streampack.core.streamers.single.SingleStreamer
+import io.github.thibaultbee.streampack.core.streamers.single.cameraSingleStreamer
+import io.github.thibaultbee.streampack.core.interfaces.setCameraId
+import io.github.thibaultbee.streampack.core.utils.extensions.isClosedException
+import io.github.thibaultbee.streampack.ext.rtmp.configuration.mediadescriptor.RtmpMediaDescriptor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.UUID
 
+/**
+ * Owns the StreamPack [SingleStreamer] and adapts it to the Pigeon host API surface.
+ *
+ * StreamPack 3.x replaced the listener-based 2.x API with a coroutine/Flow one, and moved
+ * the RTMP transport off the unmaintained `video.api:rtmpdroid` native library onto a pure
+ * Kotlin implementation -- which is what makes the plugin 16 KB page-size clean (SWAN-3182).
+ */
 class LiveStreamViewManager(
-    private val streamer: BaseCameraLiveStreamer,
+    private val context: Context,
     textureRegistry: TextureRegistry,
     private val permissionsManager: PermissionsManager,
     private val onConnectionSucceeded: () -> Unit,
@@ -21,23 +45,71 @@ class LiveStreamViewManager(
     private val onConnectionFailed: (String) -> Unit,
     private val onGenericError: (Exception) -> Unit,
     private val onVideoSizeChanged: (Size) -> Unit,
-) :
-    OnConnectionListener, OnErrorListener {
+) {
+    private val eventScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val flutterTexture = textureRegistry.createSurfaceTexture()
+
     val textureId: Long
         get() = flutterTexture.id()
+
+    private var currentCameraId: String = context.defaultCameraId
+
+    private val streamer: SingleStreamer = runBlocking {
+        cameraSingleStreamer(context = context, cameraId = currentCameraId)
+    }.also { observe(it) }
 
     private var _isPreviewing = false
     private var _isStreaming = false
     val isStreaming: Boolean
         get() = _isStreaming
 
-    private var _videoConfig: VideoConfig? = null
-    val videoConfig: VideoConfig
+    private fun observe(streamer: SingleStreamer) {
+        eventScope.launch {
+            streamer.throwableFlow
+                .filterNotNull()
+                .filter { !it.isClosedException }
+                .collect { throwable ->
+                    onGenericError(
+                        throwable as? Exception
+                            ?: Exception(throwable.message ?: throwable.javaClass.simpleName, throwable)
+                    )
+                }
+        }
+        eventScope.launch {
+            streamer.throwableFlow
+                .filterNotNull()
+                .filter { it.isClosedException }
+                .collect { throwable -> onConnectionFailed(throwable.message ?: "Connection lost") }
+        }
+        eventScope.launch {
+            streamer.isOpenFlow.collect { isOpen ->
+                if (!isOpen && _isStreaming) {
+                    onDisconnected()
+                }
+            }
+        }
+        eventScope.launch {
+            streamer.isStreamingFlow.collect { isStreaming ->
+                _isStreaming = isStreaming
+                if (isStreaming) {
+                    onConnectionSucceeded()
+                }
+            }
+        }
+    }
+
+    /** The active camera source, once the pipeline has one. */
+    private val cameraSource: ICameraSource?
+        get() = runBlocking {
+            runCatching { streamer.videoInput?.sourceFlow?.first() as? ICameraSource }.getOrNull()
+        }
+
+    private var _videoConfig: VideoCodecConfig? = null
+    val videoConfig: VideoCodecConfig
         get() = _videoConfig!!
 
     fun setVideoConfig(
-        videoConfig: VideoConfig,
+        videoConfig: VideoCodecConfig,
         onSuccess: () -> Unit,
         onError: (Exception) -> Unit
     ) {
@@ -51,21 +123,32 @@ class LiveStreamViewManager(
         if (wasPreviewing) {
             stopPreview()
         }
-        streamer.configure(videoConfig)
-        _videoConfig = videoConfig
-        if (wasPreviewing) {
-            startPreview(onSuccess, onError)
-        } else {
-            onSuccess()
+        try {
+            runBlocking { streamer.setVideoConfig(videoConfig) }
+            _videoConfig = videoConfig
+            if (wasPreviewing) {
+                startPreview(onSuccess, onError)
+            } else {
+                onSuccess()
+            }
+        } catch (e: Exception) {
+            onError(e)
         }
     }
 
-    private var _audioConfig: AudioConfig? = null
-    val audioConfig: AudioConfig
+    private var _audioConfig: AudioCodecConfig? = null
+    val audioConfig: AudioCodecConfig
         get() = _audioConfig!!
 
+    /**
+     * In StreamPack 2.x echo cancellation and noise suppression were part of the audio codec
+     * config. In 3.x they are audio-source effects, so they are applied by rebuilding the
+     * microphone source.
+     */
     fun setAudioConfig(
-        audioConfig: AudioConfig,
+        audioConfig: AudioCodecConfig,
+        enableEchoCanceler: Boolean,
+        enableNoiseSuppressor: Boolean,
         onSuccess: () -> Unit,
         onError: (Exception) -> Unit
     ) {
@@ -77,7 +160,17 @@ class LiveStreamViewManager(
             Manifest.permission.RECORD_AUDIO,
             onGranted = {
                 try {
-                    streamer.configure(audioConfig)
+                    val effects = mutableSetOf<UUID>()
+                    if (enableEchoCanceler && AcousticEchoCanceler.isAvailable()) {
+                        effects.add(android.media.audiofx.AudioEffect.EFFECT_TYPE_AEC)
+                    }
+                    if (enableNoiseSuppressor && NoiseSuppressor.isAvailable()) {
+                        effects.add(android.media.audiofx.AudioEffect.EFFECT_TYPE_NS)
+                    }
+                    runBlocking {
+                        streamer.setAudioSource(MicrophoneSourceFactory(effects = effects))
+                        streamer.setAudioConfig(audioConfig)
+                    }
                     _audioConfig = audioConfig
                     onSuccess()
                 } catch (e: Exception) {
@@ -85,15 +178,6 @@ class LiveStreamViewManager(
                 }
             },
             onShowPermissionRationale = { _ ->
-                /**
-                 * Require an AppCompat theme to use MaterialAlertDialogBuilder
-                 *
-                context.showDialog(
-                R.string.permission_required,
-                R.string.record_audio_permission_required_message,
-                android.R.string.ok,
-                onPositiveButtonClick = { onRequiredPermissionLastTime() }
-                ) */
                 onError(SecurityException("Missing permission Manifest.permission.RECORD_AUDIO"))
             },
             onDenied = {
@@ -102,35 +186,35 @@ class LiveStreamViewManager(
     }
 
     var isMuted: Boolean
-        get() = streamer.settings.audio.isMuted
+        get() = runBlocking { streamer.audioInput?.isMuted ?: false }
         set(value) {
-            streamer.settings.audio.isMuted = value
+            runBlocking { streamer.audioInput?.isMuted = value }
         }
 
     val camera: String
-        get() = streamer.camera
+        get() = currentCameraId
 
     fun setCamera(camera: String, onSuccess: () -> Unit, onError: (Exception) -> Unit) {
         permissionsManager.requestPermission(
             Manifest.permission.CAMERA,
             onGranted = {
                 try {
-                    streamer.camera = camera
-                    onSuccess()
+                    val wasPreviewing = _isPreviewing
+                    if (wasPreviewing) {
+                        stopPreview()
+                    }
+                    runBlocking { streamer.setCameraId(camera) }
+                    currentCameraId = camera
+                    if (wasPreviewing) {
+                        startPreview(onSuccess, onError)
+                    } else {
+                        onSuccess()
+                    }
                 } catch (e: Exception) {
                     onError(e)
                 }
             },
             onShowPermissionRationale = { _ ->
-                /**
-                 * Require an AppCompat theme to use MaterialAlertDialogBuilder
-                 *
-                 * context.showDialog(
-                R.string.permission_required,
-                R.string.camera_permission_required_message,
-                android.R.string.ok,
-                onPositiveButtonClick = { onRequiredPermissionLastTime() }
-                )*/
                 onError(SecurityException("Missing permission Manifest.permission.CAMERA"))
             },
             onDenied = {
@@ -138,39 +222,38 @@ class LiveStreamViewManager(
             })
     }
 
-    init {
-        streamer.onConnectionListener = this
-        streamer.onErrorListener = this
-    }
+    var zoomRatio: Float
+        get() = runBlocking { cameraSource?.settings?.zoom?.getZoomRatio() ?: DEFAULT_ZOOM_RATIO }
+        set(value) {
+            runBlocking { cameraSource?.settings?.zoom?.setZoomRatio(value) }
+        }
 
     fun dispose() {
         stopStream()
-        streamer.stopPreview()
+        eventScope.cancel()
+        runBlocking {
+            runCatching { cameraSource?.stopPreview() }
+            runCatching { streamer.release() }
+        }
         flutterTexture.release()
     }
 
     fun startStream(url: String) {
         runBlocking {
-            streamer.connect(url)
             try {
+                streamer.open(RtmpMediaDescriptor(Uri.parse(url)))
                 streamer.startStream()
-                _isStreaming = true
             } catch (e: Exception) {
-                streamer.disconnect()
-                onLost("Failed to start stream: ${e.message}")
+                onConnectionFailed(e.message ?: "Failed to start stream")
                 throw e
             }
         }
     }
 
     fun stopStream() {
-        val isConnected = streamer.isConnected
         runBlocking {
-            streamer.stopStream()
-            streamer.disconnect()
-            if (isConnected) {
-                onDisconnected()
-            }
+            runCatching { streamer.stopStream() }
+            runCatching { streamer.close() }
             _isStreaming = false
         }
     }
@@ -179,11 +262,14 @@ class LiveStreamViewManager(
         permissionsManager.requestPermission(
             Manifest.permission.CAMERA,
             onGranted = {
-                if (_videoConfig == null) {
+                val videoConfig = _videoConfig
+                if (videoConfig == null) {
                     onError(IllegalStateException("Video has not been configured!"))
                 } else {
                     try {
-                        streamer.startPreview(getSurface(videoConfig.resolution))
+                        val source = cameraSource
+                            ?: throw IllegalStateException("Camera source is not available")
+                        runBlocking { source.startPreview(getSurface(videoConfig.resolution)) }
                         _isPreviewing = true
                         onSuccess()
                     } catch (e: Exception) {
@@ -192,15 +278,6 @@ class LiveStreamViewManager(
                 }
             },
             onShowPermissionRationale = { _ ->
-                /**
-                 * Require an AppCompat theme to use MaterialAlertDialogBuilder
-                 *
-                 * context.showDialog(
-                R.string.permission_required,
-                R.string.camera_permission_required_message,
-                android.R.string.ok,
-                onPositiveButtonClick = { onRequiredPermissionLastTime() }
-                )*/
                 onError(SecurityException("Missing permission Manifest.permission.CAMERA"))
             },
             onDenied = {
@@ -209,35 +286,18 @@ class LiveStreamViewManager(
     }
 
     fun stopPreview() {
-        streamer.stopPreview()
+        runBlocking { runCatching { cameraSource?.stopPreview() } }
         _isPreviewing = false
     }
 
     private fun getSurface(resolution: Size): Surface {
         val surfaceTexture = flutterTexture.surfaceTexture().apply {
-            setDefaultBufferSize(
-                resolution.width,
-                resolution.height
-            )
+            setDefaultBufferSize(resolution.width, resolution.height)
         }
         return Surface(surfaceTexture)
     }
 
-
-    override fun onSuccess() {
-        onConnectionSucceeded()
-    }
-
-    override fun onLost(message: String) {
-        onDisconnected()
-    }
-
-    override fun onFailed(message: String) {
-        onConnectionFailed(message)
-    }
-
-    override fun onError(error: StreamPackError) {
-        _isStreaming = false
-        onGenericError(error)
+    companion object {
+        const val DEFAULT_ZOOM_RATIO = 1f
     }
 }

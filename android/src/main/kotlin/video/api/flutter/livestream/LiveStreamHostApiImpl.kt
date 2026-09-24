@@ -42,7 +42,7 @@ class LiveStreamHostApiImpl(
         flutterView?.dispose()
         instanceManager.dispose()
         flutterView = LiveStreamViewManager(
-            instanceManager.getInstance(),
+            requireNotNull(instanceManager.context) { "Context is not available" },
             textureRegistry,
             permissionsManager,
             { executeOnMain { liveStreamFlutterApi.onIsConnectedChanged(true) {} } },
@@ -58,12 +58,14 @@ class LiveStreamHostApiImpl(
             },
             { executeOnMain { liveStreamFlutterApi.onVideoSizeChanged(it.toNativeResolution()) {} } }
         )
+        instanceManager.viewManager = flutterView
         return flutterView!!.textureId
     }
 
     override fun dispose() {
         flutterView?.dispose()
         flutterView = null
+        instanceManager.dispose()
     }
 
     override fun setVideoConfig(videoConfig: NativeVideoConfig, callback: (Result<Unit>) -> Unit) {
@@ -76,6 +78,8 @@ class LiveStreamHostApiImpl(
     override fun setAudioConfig(audioConfig: NativeAudioConfig, callback: (Result<Unit>) -> Unit) {
         flutterView!!.setAudioConfig(
             audioConfig.toAudioConfig(),
+            audioConfig.enableEchoCanceler,
+            audioConfig.enableNoiseSuppressor,
             { callback(Result.success(Unit)) },
             { callback(Result.failure(it)) })
     }
