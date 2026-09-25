@@ -223,10 +223,13 @@ class LiveStreamViewManager(
     }
 
     var zoomRatio: Float
-        get() = runBlocking { cameraSource?.settings?.zoom?.getZoomRatio() ?: DEFAULT_ZOOM_RATIO }
+        get() = runBlocking { requireCameraSource().settings.zoom.getZoomRatio() }
         set(value) {
-            runBlocking { cameraSource?.settings?.zoom?.setZoomRatio(value) }
+            runBlocking { requireCameraSource().settings.zoom.setZoomRatio(value) }
         }
+
+    private fun requireCameraSource(): ICameraSource =
+        cameraSource ?: throw IllegalStateException("Camera source is not available")
 
     fun dispose() {
         stopStream()
@@ -251,10 +254,16 @@ class LiveStreamViewManager(
     }
 
     fun stopStream() {
+        val wasStreaming = _isStreaming
         runBlocking {
             runCatching { streamer.stopStream() }
             runCatching { streamer.close() }
-            _isStreaming = false
+        }
+        // Clear the flag before yielding to the event loop so the isOpenFlow collector
+        // suppresses itself and the disconnect is reported exactly once.
+        _isStreaming = false
+        if (wasStreaming) {
+            onDisconnected()
         }
     }
 
@@ -295,9 +304,5 @@ class LiveStreamViewManager(
             setDefaultBufferSize(resolution.width, resolution.height)
         }
         return Surface(surfaceTexture)
-    }
-
-    companion object {
-        const val DEFAULT_ZOOM_RATIO = 1f
     }
 }
